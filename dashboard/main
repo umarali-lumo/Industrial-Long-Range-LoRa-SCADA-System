@@ -1,0 +1,1192 @@
+import sys
+import math
+import csv
+import time
+import serial
+import serial.tools.list_ports
+from datetime import datetime
+
+from PyQt6.QtWidgets import *
+from PyQt6.QtCore import *
+from PyQt6.QtGui import *
+
+
+class SerialReader(QThread):
+    data_received = pyqtSignal(str)
+
+    def __init__(self, ser):
+        super().__init__()
+        self.ser = ser
+        self.running = True
+
+    def run(self):
+        while self.running:
+            try:
+                if self.ser and self.ser.in_waiting:
+                    line = self.ser.readline().decode(errors='ignore').strip()
+                    if line:
+                        self.data_received.emit(line)
+            except:
+                pass
+
+    def stop(self):
+        self.running = False
+
+
+class MiniWaveformChart(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.data_points = [0] * 30
+        self.setMinimumHeight(240)
+
+    def add_point(self, value):
+        self.data_points.pop(0)
+        self.data_points.append(value)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#090A0D"))
+        
+        painter.setPen(QPen(QColor("#1E232B"), 1, Qt.PenStyle.DashLine))
+        w, h = self.width(), self.height()
+        for i in range(1, 6):
+            painter.drawLine(int(w * i / 6), 10, int(w * i / 6), h - 10)
+            painter.drawLine(10, int(h * i / 6), w - 10, int(h * i / 6))
+
+        if not self.data_points:
+            return
+
+        path = QPainterPath()
+        max_val = 100
+        step_x = w / (len(self.data_points) - 1)
+        
+        start_y = h - 10 - ((self.data_points[0] / max_val) * (h - 20))
+        path.moveTo(0, start_y)
+        
+        for idx, val in enumerate(self.data_points):
+            x = idx * step_x
+            y = h - 10 - ((val / max_val) * (h - 20))
+            path.lineTo(x, y)
+            
+        painter.setPen(QPen(QColor("#A3E635"), 2.5, Qt.PenStyle.SolidLine))
+        painter.drawPath(path)
+
+
+class GlowSliderWidget(QWidget):
+    valueChanged = pyqtSignal(int)
+
+    def __init__(self, label=""):
+        super().__init__()
+        self.value = 0 
+        self.setMinimumSize(220, 180)
+        self.setCursor(Qt.CursorShape.SplitVCursor)
+        self.dragging = False
+
+        self.padding_top = 25
+        self.padding_bottom = 25
+        self.line_x = 75 
+
+    def set_value(self, total_seconds):
+        if total_seconds < 0:
+            total_seconds = 0
+        if self.value != total_seconds:
+            self.value = total_seconds
+            self.valueChanged.emit(self.value)
+            self.update()
+
+    def get_value(self):
+        return self.value
+
+    def _val_to_ratio(self):
+        if self.value == 0:
+            return 1.0
+        if self.value <= 60:
+            return (self.value / 60.0) * 0.5
+        else:
+            minutes = self.value / 60.0
+            minutes = min(60.0, minutes)
+            return 0.5 + ((minutes - 1.0) / 59.0) * 0.45
+
+    def _ratio_to_val(self, ratio):
+        if ratio >= 0.96:
+            return 0
+        if ratio <= 0.5:
+            secs = int((ratio / 0.5) * 60)
+            return secs
+        else:
+            norm_ratio = (ratio - 0.5) / 0.45
+            minutes = 1 + int(norm_ratio * 59)
+            minutes = min(60, minutes)
+            return minutes * 60
+
+    def _val_to_y(self):
+        usable_h = self.height() - self.padding_top - self.padding_bottom
+        ratio = self._val_to_ratio()
+        return self.height() - self.padding_bottom - int(ratio * usable_h)
+
+    def _y_to_val(self, y):
+        usable_h = self.height() - self.padding_top - self.padding_bottom
+        raw_ratio = (self.height() - self.padding_bottom - y) / usable_h
+        ratio = max(0.0, min(1.0, raw_ratio))
+        return self._ratio_to_val(ratio)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.dragging = True
+            self.set_value(self._y_to_val(event.position().y()))
+
+    def mouseMoveEvent(self, event):
+        if self.dragging:
+            self.set_value(self._y_to_val(event.position().y()))
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.dragging = False
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        w, h = self.width(), self.height()
+        slider_y = self._val_to_y()
+        usable_h = h - self.padding_top - self.padding_bottom
+
+        scale_points = [
+            (0.0, "0s"), (0.125, "15s"), (0.25, "30s"), (0.375, "45s"), (0.5, "60s"),
+            (0.6125, "15m"), (0.725, "30m"), (0.8375, "45m"), (0.95, "60m"), (1.0, "∞")
+        ]
+
+        for ratio, text in scale_points:
+            ty = h - self.padding_bottom - int(ratio * usable_h)
+            painter.setPen(QPen(QColor("#475569" if text == "∞" or "0" in text or "60" in text else "#1E293B"), 1.2))
+            painter.drawLine(self.line_x - 15, ty, self.line_x - 8, ty)
+            
+            painter.setPen(QColor("#475569" if text != "∞" else "#A3E635"))
+            painter.setFont(QFont("Segoe UI", 7 if text != "∞" else 9, QFont.Weight.Bold if text == "∞" else QFont.Weight.Normal))
+            painter.drawText(QRect(self.line_x - 52, ty - 9, 32, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, text)
+
+        line_path = QPainterPath()
+        line_path.moveTo(self.line_x, self.padding_top)
+        
+        curve_radius = 45
+        curve_depth = 12
+        y_start_curve = slider_y - curve_radius
+        y_end_curve = slider_y + curve_radius
+        
+        if y_start_curve > self.padding_top:
+            line_path.lineTo(self.line_x, y_start_curve)
+            
+        line_path.cubicTo(
+            self.line_x, slider_y - (curve_radius / 2),
+            self.line_x + curve_depth, slider_y - (curve_radius / 3),
+            self.line_x + curve_depth, slider_y
+        )
+        line_path.cubicTo(
+            self.line_x + curve_depth, slider_y + (curve_radius / 3),
+            self.line_x, slider_y + (curve_radius / 2),
+            self.line_x, y_end_curve
+        )
+        
+        if y_end_curve < h - self.padding_bottom:
+            line_path.lineTo(self.line_x, h - self.padding_bottom)
+
+        glow_gradient = QRadialGradient(QPointF(self.line_x, slider_y), curve_radius)
+        glow_gradient.setColorAt(0.0, QColor(163, 230, 53, 55)) 
+        glow_gradient.setColorAt(0.6, QColor(163, 230, 53, 15))
+        glow_gradient.setColorAt(1.0, QColor(0, 0, 0, 0))
+        painter.setBrush(QBrush(glow_gradient))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(QPoint(self.line_x - 10, slider_y), curve_radius, curve_radius)
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor("#A3E635"), 2.2, Qt.PenStyle.SolidLine))
+        painter.drawPath(line_path)
+
+        knob_center = QPoint(self.line_x + curve_depth, slider_y)
+        knob_radius = 16
+        
+        painter.setBrush(QBrush(QColor("#0F1115")))
+        painter.setPen(QPen(QColor("#2A313C"), 2))
+        painter.drawEllipse(knob_center, knob_radius, knob_radius)
+        
+        painter.setBrush(QBrush(QColor("#1E232B")))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(knob_center, knob_radius - 3, knob_radius - 3)
+
+        painter.setPen(QPen(QColor("#A3E635"), 2, Qt.PenStyle.SolidLine))
+        painter.drawLine(knob_center.x() - 3, knob_center.y() - 2, knob_center.x(), knob_center.y() - 5)
+        painter.drawLine(knob_center.x(), knob_center.y() - 5, knob_center.x() + 3, knob_center.y() - 2)
+        painter.drawLine(knob_center.x() - 3, knob_center.y() + 2, knob_center.x(), knob_center.y() + 5)
+        painter.drawLine(knob_center.x(), knob_center.y() + 5, knob_center.x() + 3, knob_center.y() + 2)
+
+        painter.setPen(QColor("#A3E635" if self.value > 0 else "#475569"))
+        if self.value == 0:
+            display_str = "∞"
+            unit_str = ""
+        elif self.value < 60:
+            display_str = str(self.value)
+            unit_str = "sec"
+        else:
+            display_str = str(int(self.value // 60))
+            unit_str = "min"
+
+        painter.setFont(QFont("Segoe UI", 42, QFont.Weight.Light))
+        text_rect = QRect(self.line_x + curve_depth + 20, 0, 110, h)
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, display_str)
+        
+        if unit_str:
+            painter.setFont(QFont("Segoe UI", 12, QFont.Weight.Medium))
+            painter.setPen(QColor("#94A3B8"))
+            metrics = QFontMetrics(QFont("Segoe UI", 42, QFont.Weight.Light))
+            text_w = metrics.horizontalAdvance(display_str)
+            unit_rect = QRect(self.line_x + curve_depth + 25 + text_w, (h // 2) + 8, 50, 30)
+            painter.drawText(unit_rect, Qt.AlignmentFlag.AlignLeft, unit_str)
+
+
+class InteractiveRelayCard(QFrame):
+    toggled = pyqtSignal(int)
+
+    def __init__(self, channel_idx, title):
+        super().__init__()
+        self.channel_idx = channel_idx
+        self.is_on = False
+        
+        self.setObjectName("RelayControlCard")
+        self.setMinimumHeight(150)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        top_row = QHBoxLayout()
+        self.title_lbl = QLabel(title)
+        self.title_lbl.setStyleSheet("font-weight: bold; font-size: 11pt; color: #F8FAFC;")
+        
+        self.status_badge = QLabel("OFF")
+        self.status_badge.setObjectName("BadgeOff")
+        self.status_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_badge.setFixedSize(50, 22)
+        
+        top_row.addWidget(self.title_lbl)
+        top_row.addStretch()
+        top_row.addWidget(self.status_badge)
+        layout.addLayout(top_row)
+
+        self.info_lbl = QLabel("State: Idle (0s)")
+        self.info_lbl.setStyleSheet("color: #64748B; font-size: 8.5pt;")
+        layout.addWidget(self.info_lbl)
+
+        self.btn_toggle = QPushButton("POWER ON")
+        self.btn_toggle.setObjectName("RelayOffBtn")
+        self.btn_toggle.setFixedHeight(38)
+        self.btn_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_toggle.clicked.connect(lambda: self.toggled.emit(self.channel_idx))
+        layout.addWidget(self.btn_toggle)
+
+    def set_state(self, state: bool, info_str=""):
+        self.is_on = state
+        if info_str:
+            self.info_lbl.setText(info_str)
+            
+        if self.is_on:
+            self.status_badge.setText("ACTIVE")
+            self.status_badge.setObjectName("BadgeOn")
+            self.btn_toggle.setText("POWER OFF")
+            self.btn_toggle.setObjectName("RelayOnBtn")
+            self.setProperty("active", True)
+        else:
+            self.status_badge.setText("OFF")
+            self.status_badge.setObjectName("BadgeOff")
+            self.btn_toggle.setText("POWER ON")
+            self.btn_toggle.setObjectName("RelayOffBtn")
+            self.setProperty("active", False)
+
+        self.status_badge.setStyle(self.status_badge.style())
+        self.btn_toggle.setStyle(self.btn_toggle.style())
+        self.setStyle(self.style())
+
+
+class Dashboard(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+        self.ser = None
+        self.reader = None
+        self.packet_count = 0
+        self.interlocked_indices = []
+        self.is_dark_theme = True
+        self.log_history = []
+        
+        self.current_relay_states = [False, False, False, False]
+        self.relay_time_limits = [0, 0, 0, 0]
+        self.relay_time_elapsed = [0, 0, 0, 0]
+        
+        self.fallback_timer = QTimer()
+        self.fallback_timer.timeout.connect(self.process_relay_timeouts)
+        self.fallback_timer.start(1000)
+
+        self.setWindowTitle("Industrial LoRa SCADA Dashboard")
+        self.resize(1340, 900)
+
+        self.build_ui()
+        self.apply_style()
+
+    def build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        sidebar = QWidget()
+        sidebar.setObjectName("Sidebar")
+        sidebar.setFixedWidth(240)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(20, 24, 20, 24)
+        sidebar_layout.setSpacing(10)
+
+        profile_layout = QHBoxLayout()
+        avatar = QLabel("UA")
+        avatar.setObjectName("Avatar")
+        avatar.setFixedSize(36, 36)
+        avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        user_name = QLabel("Umar Ali")
+        user_name.setStyleSheet("font-weight: bold; color: #FFFFFF; background: transparent;")
+        
+        profile_layout.addWidget(avatar)
+        profile_layout.addWidget(user_name)
+        profile_layout.addStretch()
+        sidebar_layout.addLayout(profile_layout)
+
+        nav_title = QLabel("DASHBOARDS")
+        nav_title.setStyleSheet("font-size: 9pt; color: #64748B; font-weight: bold; margin-top: 20px; background: transparent;")
+        sidebar_layout.addWidget(nav_title)
+
+        self.btn_overview = QPushButton("  Overview")
+        self.btn_overview.setObjectName("NavButtonActive")
+        self.btn_analytics = QPushButton("  Analytics")
+        self.btn_analytics.setObjectName("NavButton")
+        self.btn_project = QPushButton("  Project Overview")
+        self.btn_project.setObjectName("NavButton")
+        self.btn_interlock = QPushButton("  Safety Interlocks")
+        self.btn_interlock.setObjectName("NavButton")
+        self.btn_timed_fallback = QPushButton("  Timed Fallbacks")
+        self.btn_timed_fallback.setObjectName("NavButton")
+
+        sidebar_layout.addWidget(self.btn_overview)
+        sidebar_layout.addWidget(self.btn_analytics)
+        sidebar_layout.addWidget(self.btn_project)
+        sidebar_layout.addWidget(self.btn_interlock)
+        sidebar_layout.addWidget(self.btn_timed_fallback)
+        
+        self.theme_btn = QPushButton(" 🌓 Switch Theme")
+        self.theme_btn.setObjectName("SecondaryButton")
+        self.theme_btn.clicked.connect(self.toggle_theme)
+        sidebar_layout.addWidget(self.theme_btn)
+        
+        sidebar_layout.addStretch()
+        
+        logo = QLabel("⚡ TEAM LUMO")
+        logo.setStyleSheet("font-weight: bold; font-size: 14pt; color: #A3E635; letter-spacing: 1px; background: transparent;")
+        sidebar_layout.addWidget(logo)
+        main_layout.addWidget(sidebar)
+
+        self.page_container = QStackedWidget()
+        self.page_container.setObjectName("CentralWidget")
+        
+        self.btn_overview.clicked.connect(lambda: self.switch_page(0, self.btn_overview))
+        self.btn_analytics.clicked.connect(lambda: self.switch_page(1, self.btn_analytics))
+        self.btn_project.clicked.connect(lambda: self.switch_page(2, self.btn_project))
+        self.btn_interlock.clicked.connect(lambda: self.switch_page(3, self.btn_interlock))
+        self.btn_timed_fallback.clicked.connect(lambda: self.switch_page(4, self.btn_timed_fallback))
+
+        page_overview = QWidget()
+        overview_layout = QVBoxLayout(page_overview)
+        overview_layout.setContentsMargins(24, 24, 24, 24)
+        overview_layout.setSpacing(20)
+
+        top_bar_frame = QFrame()
+        top_bar_frame.setObjectName("TopControlBar")
+        top_bar = QHBoxLayout(top_bar_frame)
+        top_bar.setContentsMargins(16, 12, 16, 12)
+
+        title_vbox = QVBoxLayout()
+        title = QLabel("Live SCADA Viewport")
+        title.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
+        title.setStyleSheet("color: white; margin: 0;")
+        subtitle = QLabel("Real-time RF Node Command & Supervisory Deck")
+        subtitle.setStyleSheet("color: #64748B; font-size: 8.5pt;")
+        title_vbox.addWidget(title)
+        title_vbox.addWidget(subtitle)
+        top_bar.addLayout(title_vbox)
+        top_bar.addStretch()
+        
+        top_bar.addWidget(QLabel("COM Port:"))
+        self.port_combo = QComboBox()
+        self.refresh_ports()
+        top_bar.addWidget(self.port_combo)
+
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.setObjectName("SecondaryButton")
+        refresh_btn.clicked.connect(self.refresh_ports)
+        top_bar.addWidget(refresh_btn)
+
+        self.connect_btn = QPushButton("Connect")
+        self.connect_btn.setObjectName("PrimaryButton")
+        self.connect_btn.clicked.connect(self.toggle_connection)
+        top_bar.addWidget(self.connect_btn)
+
+        estop_btn = QPushButton("🚨 E-STOP")
+        estop_btn.setObjectName("EStopButton")
+        estop_btn.clicked.connect(lambda: self.trigger_hardware_safety_trip("EMERGENCY STOP PRESSED"))
+        top_bar.addWidget(estop_btn)
+
+        overview_layout.addWidget(top_bar_frame)
+
+        cards_layout = QHBoxLayout()
+        cards_layout.setSpacing(15)
+        self.rssi_label = QLabel("-- dBm")
+        self.packet_label = QLabel("0")
+        self.node_label = QLabel("Node 03")
+        
+        cards_layout.addWidget(self.make_card("SIGNAL RSSI", self.rssi_label, "100% Stable"))
+        cards_layout.addWidget(self.make_card("TOTAL PACKETS", self.packet_label, "+ Dynamic"))
+        cards_layout.addWidget(self.make_card("ACTIVE GATEWAY", self.node_label, "LoRa 433MHz"))
+        overview_layout.addLayout(cards_layout)
+
+        relay_group = QGroupBox("Interactive Relay Command Grid")
+        relay_grid = QGridLayout(relay_group)
+        relay_grid.setContentsMargins(16, 20, 16, 16)
+        relay_grid.setSpacing(15)
+
+        self.relay_cards = []
+        for i in range(4):
+            card = InteractiveRelayCard(i, f"RELAY NODE 0{i+1}")
+            card.toggled.connect(self.toggle_relay_manual)
+            self.relay_cards.append(card)
+            relay_grid.addWidget(card, i // 2, i % 2)
+
+        overview_layout.addWidget(relay_group)
+
+        log_box = QGroupBox("Live Hardware Communication Stream Console")
+        log_layout = QVBoxLayout(log_box)
+        
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        log_layout.addWidget(self.log)
+        
+        cli_layout = QHBoxLayout()
+        cli_layout.setSpacing(10)
+        cli_prompt = QLabel(">$")
+        cli_prompt.setStyleSheet("color: #34D399; font-family: 'Consolas'; font-weight: bold; font-size: 11pt;")
+        
+        self.cli_input = QLineEdit()
+        self.cli_input.setObjectName("CliInput")
+        self.cli_input.setPlaceholderText("Enter custom command packet string... (e.g. CMD|1|0|1|0)")
+        self.cli_input.returnPressed.connect(self.send_cli_command)
+        
+        cli_send_btn = QPushButton("Execute")
+        cli_send_btn.setObjectName("SecondaryButton")
+        cli_send_btn.setFixedWidth(95)
+        cli_send_btn.clicked.connect(self.send_cli_command)
+        
+        export_btn = QPushButton("💾 Export CSV")
+        export_btn.setObjectName("SecondaryButton")
+        export_btn.clicked.connect(self.export_logs_to_csv)
+        
+        cli_layout.addWidget(cli_prompt)
+        cli_layout.addWidget(self.cli_input)
+        cli_layout.addWidget(cli_send_btn)
+        cli_layout.addWidget(export_btn)
+        log_layout.addLayout(cli_layout)
+        overview_layout.addWidget(log_box)
+
+        self.page_container.addWidget(page_overview)
+
+        page_analytics = QWidget()
+        analytics_layout = QVBoxLayout(page_analytics)
+        analytics_layout.setContentsMargins(24, 24, 24, 24)
+        analytics_layout.setSpacing(20)
+        
+        an_title = QLabel("Telemetry Analytics & Waveforms")
+        an_title.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
+        analytics_layout.addWidget(an_title)
+        
+        chart_box = QGroupBox("Signal Health Index Waveform Stream")
+        chart_layout = QVBoxLayout(chart_box)
+        self.waveform = MiniWaveformChart()
+        chart_layout.addWidget(self.waveform)
+        analytics_layout.addWidget(chart_box)
+        
+        stats_layout = QHBoxLayout()
+        self.lbl_uptime = QLabel("99.84 %")
+        self.lbl_latency = QLabel("48 ms")
+        stats_layout.addWidget(self.make_card("LINK AVAILABILITY", self.lbl_uptime, "Nominal"))
+        stats_layout.addWidget(self.make_card("ROUND TRIP TIME", self.lbl_latency, "Optimal"))
+        analytics_layout.addLayout(stats_layout)
+        analytics_layout.addStretch()
+
+        self.page_container.addWidget(page_analytics)
+
+        page_project = QWidget()
+        project_layout = QVBoxLayout(page_project)
+        project_layout.setContentsMargins(24, 24, 24, 24)
+        project_layout.setSpacing(20)
+        
+        proj_title = QLabel("System Architecture & Specifications")
+        proj_title.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
+        project_layout.addWidget(proj_title)
+
+        flow_box = QGroupBox("Data Pipeline Flow Architecture")
+        flow_layout = QHBoxLayout(flow_box)
+        flow_layout.setContentsMargins(15, 20, 15, 20)
+        flow_layout.setSpacing(8)
+
+        pipeline_nodes = [
+            ("EDGE SENSORS\n& RS485 INPUTS", "#1E293B"),
+            ("➔", "arrow"),
+            ("ESP32 TX\nBASE STATION", "#1E232B"),
+            ("➔", "arrow"),
+            ("SX1278 LORA\nRF TRANSMITTER", "#A3E635"),
+            ("⚡ Wireless 433MHz Link ⚡", "link"),
+            ("SX1278 LORA\nRF RECEIVER", "#A3E635"),
+            ("➔", "arrow"),
+            ("ESP32 RX\nFIELD END-NODE", "#1E232B"),
+            ("➔", "arrow"),
+            ("4-CH ISOLATED\nRELAY UNIT", "#15803D")
+        ]
+
+        for text, style_type in pipeline_nodes:
+            lbl = QLabel(text)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            if style_type == "arrow":
+                lbl.setStyleSheet("color: #64748B; font-size: 14pt; font-weight: bold;")
+                flow_layout.addWidget(lbl, stretch=0)
+            elif style_type == "link":
+                lbl.setStyleSheet("color: #FBBF24; font-size: 9pt; font-weight: bold; font-family: 'Consolas'; font-style: italic; padding: 0 5px;")
+                flow_layout.addWidget(lbl, stretch=1)
+            else:
+                text_color = "#0F1115" if style_type == "#A3E635" else "#F8FAFC"
+                lbl.setWordWrap(True)
+                lbl.setMinimumSize(120, 65)
+                lbl.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+                lbl.setStyleSheet(f"background-color: {style_type}; color: {text_color}; border: 1px solid rgba(255,255,255,0.05); border-radius: 6px; padding: 6px;")
+                flow_layout.addWidget(lbl, stretch=2)
+        
+        project_layout.addWidget(flow_box)
+
+        grid_container = QWidget()
+        grid_layout = QGridLayout(grid_container)
+        grid_layout.setContentsMargins(0, 0, 0, 0)
+        grid_layout.setSpacing(15)
+
+        cards_data = [
+            ("📡 Core Connectivity", [
+                "• Powered by ESP32 + SX1278 LoRa configuration.",
+                "• Operates on ultra-stable noise-resistant 433MHz band.",
+                "• Implements raw packet-level integrity filters."
+            ]),
+            ("🔌 Edge Interface Capabilities", [
+                "• Supports multi-source inputs: Industrial RS485 Modbus.",
+                "• Built-in universal telemetry analog/digital sensor lines.",
+                "• High electrical isolation prevents cross-talk."
+            ]),
+            ("⚡ Output Executions", [
+                "• Real-time independent 4-Channel Relay logic driver.",
+                "• Safe default fallbacks (Active-High/Low software triggers).",
+                "• Hardware feedback validation over long-range line-of-sight."
+            ]),
+            ("💻 SCADA Application Layer", [
+                "• Instant bidirectional tracking over high-speed USB pipeline.",
+                "• Live diagnostic text logs alongside a raw CLI developer deck.",
+                "• Scalable alternative for smart agriculture & automation."
+            ])
+        ]
+
+        for i, (header, points) in enumerate(cards_data):
+            c_box = QGroupBox(header)
+            c_vbox = QVBoxLayout(c_box)
+            c_vbox.setSpacing(8)
+            c_vbox.setContentsMargins(15, 20, 15, 15)
+            
+            for pt in points:
+                pt_lbl = QLabel(pt)
+                pt_lbl.setWordWrap(True)
+                c_vbox.addWidget(pt_lbl)
+            
+            c_vbox.addStretch()
+            grid_layout.addWidget(c_box, i // 2, i % 2)
+
+        project_layout.addWidget(grid_container)
+        project_layout.addStretch()
+        
+        self.page_container.addWidget(page_project)
+
+        page_interlock = QWidget()
+        interlock_layout = QVBoxLayout(page_interlock)
+        interlock_layout.setContentsMargins(24, 24, 24, 24)
+        interlock_layout.setSpacing(25)
+
+        int_title = QLabel("Safety Interlock Control Configuration")
+        int_title.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
+        interlock_layout.addWidget(int_title)
+
+        self.badge_box = QGroupBox("Active Firmware Supervisor Guard Status")
+        badge_vbox = QVBoxLayout(self.badge_box)
+        badge_vbox.setContentsMargins(15, 15, 15, 15)
+        
+        self.interlock_status_lbl = QLabel("🛡️ SAFETY INTERLOCKS ACTIVE — NO ACTIVE VIOLATIONS")
+        self.interlock_status_lbl.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        self.interlock_status_lbl.setStyleSheet("color: #34D399; padding: 12px; background: #064E3B; border-radius: 6px;")
+        badge_vbox.addWidget(self.interlock_status_lbl)
+        interlock_layout.addWidget(self.badge_box)
+
+        selector_box = QGroupBox("Select Relays to Bind Together in the Interlock Rule Set")
+        selector_vbox = QVBoxLayout(selector_box)
+        selector_vbox.setContentsMargins(24, 24, 24, 24)
+        selector_vbox.setSpacing(15)
+
+        selector_desc = QLabel("Click multiple numbers below to group them. Active selections cannot be powered on at the same time.")
+        selector_desc.setStyleSheet("color: #64748B; font-size: 9.5pt;")
+        selector_vbox.addWidget(selector_desc)
+
+        btn_row_layout = QHBoxLayout()
+        btn_row_layout.setSpacing(12)
+        btn_row_layout.addStretch()
+
+        self.selector_buttons = []
+        for i in range(1, 5):
+            btn = QPushButton(str(i))
+            btn.setObjectName("SegmentSelectorButton")
+            btn.setCheckable(True)
+            btn.setFixedSize(54, 54)
+            btn.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+            btn.toggled.connect(self.update_interlock_group_rules)
+            btn_row_layout.addWidget(btn)
+            self.selector_buttons.append(btn)
+
+        btn_row_layout.addStretch()
+        selector_vbox.addLayout(btn_row_layout)
+        interlock_layout.addWidget(selector_box)
+        
+        reset_layout = QHBoxLayout()
+        btn_clear_rules = QPushButton("Reset to Normal (No Interlocks)")
+        btn_clear_rules.setObjectName("SecondaryButton")
+        btn_clear_rules.setFixedWidth(260)
+        btn_clear_rules.clicked.connect(self.reset_all_interlock_rules)
+        reset_layout.addWidget(btn_clear_rules)
+        interlock_layout.addLayout(reset_layout)
+        
+        interlock_layout.addStretch()
+        self.page_container.addWidget(page_interlock)
+
+        page_fallback = QWidget()
+        fallback_layout = QVBoxLayout(page_fallback)
+        fallback_layout.setContentsMargins(24, 24, 24, 24)
+        fallback_layout.setSpacing(15)
+
+        fallback_title = QLabel("Independent Relay Auto-Shutdown Configurations")
+        fallback_title.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
+        fallback_layout.addWidget(fallback_title)
+
+        desc_lbl = QLabel("Drag vertical dials to set safe runtimes. Bottom half adjusts 0-60s, Top half adjusts 1-60m. Max top selection forces Continuous (∞) operation.")
+        desc_lbl.setStyleSheet("color: #64748B; font-size: 10pt; margin-bottom: 5px;")
+        fallback_layout.addWidget(desc_lbl)
+
+        sliders_container_layout = QHBoxLayout()
+        sliders_container_layout.setSpacing(10)
+
+        self.sliders = []
+        self.progress_bars = []
+        
+        for i in range(4):
+            column_box = QGroupBox(f"NODE CH. 0{i+1}")
+            column_vbox = QVBoxLayout(column_box)
+            column_vbox.setContentsMargins(10, 15, 10, 15)
+            column_vbox.setSpacing(12)
+
+            slider_widget = GlowSliderWidget()
+            slider_widget.valueChanged.connect(lambda val, idx=i: self.update_relay_timeout_limit(idx, val))
+            column_vbox.addWidget(slider_widget, stretch=1)
+            self.sliders.append(slider_widget)
+
+            progress = QProgressBar()
+            progress.setRange(0, 100)
+            progress.setValue(0)
+            progress.setTextVisible(True)
+            progress.setFormat("Idle")
+            progress.setMinimumHeight(24)
+            progress.setStyleSheet("""
+                QProgressBar { background-color: #090A0D; border: 1px solid #1E232B; border-radius: 6px; text-align: center; color: #F8FAFC; font-weight: bold; font-size: 8.5pt; }
+                QProgressBar::chunk { background-color: #EF4444; border-radius: 5px; }
+            """)
+            column_vbox.addWidget(progress)
+            self.progress_bars.append(progress)
+
+            sliders_container_layout.addWidget(column_box)
+
+        fallback_layout.addLayout(sliders_container_layout)
+        fallback_layout.addStretch()
+        self.page_container.addWidget(page_fallback)
+
+        main_layout.addWidget(self.page_container, stretch=3)
+
+        right_sidebar = QWidget()
+        right_sidebar.setObjectName("RightSidebar")
+        right_sidebar.setFixedWidth(280)
+        right_layout = QVBoxLayout(right_sidebar)
+        right_layout.setContentsMargins(20, 24, 20, 24)
+        right_layout.setSpacing(20)
+
+        status_card = QFrame()
+        status_card.setObjectName("StatusCard")
+        status_card_layout = QVBoxLayout(status_card)
+        status_card_layout.setContentsMargins(15, 15, 15, 15)
+        
+        st_title = QLabel("SYSTEM STATUS")
+        st_title.setStyleSheet("font-size: 9pt; color: #94A3B8; font-weight: bold;")
+        self.status_label = QLabel("OFFLINE")
+        self.status_label.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
+        self.status_label.setStyleSheet("color: #EF4444;")
+        
+        status_card_layout.addWidget(st_title)
+        status_card_layout.addWidget(self.status_label)
+        right_layout.addWidget(status_card)
+
+        team_group = QGroupBox("Project Operators")
+        team_layout = QVBoxLayout(team_group)
+        team_layout.setSpacing(12)
+        
+        operators = [
+            ("Syed Umar Ali", "Team Leader / 23047"),
+            ("Syeda Noor Fatima", "23048"),
+            ("Ayesha Lakho", "23007"),
+            ("Abdul Basit", "23001")
+        ]
+        
+        for name, role in operators:
+            row = QHBoxLayout()
+            p_avatar = QLabel(name[0])
+            p_avatar.setObjectName("TeamAvatar")
+            p_avatar.setFixedSize(28, 28)
+            p_avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            
+            lbl_layout = QVBoxLayout()
+            lbl_name = QLabel(name)
+            lbl_name.setStyleSheet("font-weight: bold; font-size: 10pt;")
+            lbl_role = QLabel(role)
+            lbl_role.setStyleSheet("color: #64748B; font-size: 8.5pt;")
+            lbl_layout.addWidget(lbl_name)
+            lbl_layout.addWidget(lbl_role)
+            lbl_layout.setSpacing(1)
+            
+            row.addWidget(p_avatar)
+            row.addLayout(lbl_layout)
+            row.addStretch()
+            team_layout.addLayout(row)
+            
+        right_layout.addWidget(team_group)
+        right_layout.addStretch()
+        main_layout.addWidget(right_sidebar)
+
+    def append_log(self, text):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        entry = f"[{timestamp}] {text}"
+        self.log.append(entry)
+        self.log_history.append((timestamp, text))
+
+    def toggle_theme(self):
+        self.is_dark_theme = not self.is_dark_theme
+        self.apply_style()
+
+    def toggle_relay_manual(self, index):
+        if not self.ser or not self.ser.is_open:
+            self.append_log("⚠️ Hardware connection offline. Connect to COM port first.")
+            return
+
+        next_states = list(self.current_relay_states)
+        next_states[index] = not next_states[index]
+        
+        payload_bits = ["1" if s else "0" for s in next_states]
+        cmd_str = f"CMD|{'|'.join(payload_bits)}"
+        
+        self.cli_input.setText(cmd_str)
+        self.send_cli_command()
+
+    def export_logs_to_csv(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export Telemetry Logs", "", "CSV Files (*.csv)")
+        if path:
+            try:
+                with open(path, mode='w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["Timestamp", "Event / Command"])
+                    writer.writerows(self.log_history)
+                QMessageBox.information(self, "Export Successful", f"Logs exported to {path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Export Failed", str(e))
+
+    def make_card(self, title, value_widget, tag=""):
+        box = QGroupBox(title)
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(15, 15, 15, 15)
+        
+        top_row = QHBoxLayout()
+        value_widget.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        value_widget.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
+        top_row.addWidget(value_widget)
+        
+        if tag:
+            tag_lbl = QLabel(tag)
+            tag_lbl.setStyleSheet("color: #A3E635; font-weight: bold; font-size: 8pt; background: rgba(163, 230, 53, 0.1); border-radius: 4px; padding: 3px 6px;")
+            top_row.addStretch()
+            top_row.addWidget(tag_lbl)
+            
+        layout.addLayout(top_row)
+        return box
+
+    def switch_page(self, index, active_button):
+        self.btn_overview.setObjectName("NavButton")
+        self.btn_analytics.setObjectName("NavButton")
+        self.btn_project.setObjectName("NavButton")
+        self.btn_interlock.setObjectName("NavButton")
+        self.btn_timed_fallback.setObjectName("NavButton")
+        
+        active_button.setObjectName("NavButtonActive")
+        
+        self.btn_overview.setStyle(self.btn_overview.style())
+        self.btn_analytics.setStyle(self.btn_analytics.style())
+        self.btn_project.setStyle(self.btn_project.style())
+        self.btn_interlock.setStyle(self.btn_interlock.style())
+        self.btn_timed_fallback.setStyle(self.btn_timed_fallback.style())
+        
+        self.page_container.setCurrentIndex(index)
+
+    def apply_style(self):
+        if self.is_dark_theme:
+            self.setStyleSheet("""
+                QMainWindow { background: #0B0C10; }
+                QWidget { color: #94A3B8; font-family: 'Segoe UI', sans-serif; font-size: 10pt; }
+                QWidget#Sidebar { background-color: rgba(30, 41, 59, 0.45); border-right: 1px solid rgba(255, 255, 255, 0.08); }
+                QWidget#CenterWidget { background-color: #0F1115; }
+                QWidget#RightSidebar { background-color: #12151A; border-left: 1px solid #1E232B; }
+                
+                QFrame#TopControlBar { background: #14171C; border: 1px solid #1E232B; border-radius: 12px; }
+                
+                QLabel#Avatar { background-color: #A3E635; color: #0F1115; border-radius: 18px; font-weight: bold; font-size: 10pt; }
+                QPushButton#NavButton { background: transparent; color: #94A3B8; border: none; text-align: left; padding: 11px 14px; border-radius: 8px; font-weight: 500; }
+                QPushButton#NavButton:hover { background: rgba(255, 255, 255, 0.06); color: #F8FAFC; }
+                QPushButton#NavButtonActive { background: rgba(163, 230, 53, 0.15); color: #A3E635; border: 1px solid rgba(163, 230, 53, 0.25); text-align: left; padding: 11px 14px; border-radius: 8px; font-weight: bold; }
+                
+                QGroupBox { background: #14171C; border: 1px solid #1E232B; border-radius: 12px; margin-top: 14px; font-size: 8.5pt; font-weight: bold; color: #64748B; padding: 15px; }
+                QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 15px; top: 5px; }
+                
+                QFrame#StatusCard { background: #1E232B; border-radius: 12px; border: 1px solid #2A313C; }
+                QLabel#TeamAvatar { background-color: #2A313C; color: #E2E8F0; border-radius: 14px; font-weight: bold; font-size: 9pt; }
+                
+                QPushButton#PrimaryButton { background: #A3E635; color: #0F1115; border: none; border-radius: 8px; padding: 6px 16px; font-weight: bold; }
+                QPushButton#PrimaryButton:hover { background: #BEF264; }
+                QPushButton#SecondaryButton { background: #1E232B; color: #E2E8F0; border: 1px solid #2A313C; border-radius: 8px; padding: 6px 14px; }
+                QPushButton#SecondaryButton:hover { background: #2A313C; }
+                
+                QPushButton#EStopButton { background: #DC2626; color: white; font-weight: bold; border-radius: 8px; padding: 6px 16px; border: 1px solid #EF4444; }
+                QPushButton#EStopButton:hover { background: #B91C1C; }
+
+                QFrame#RelayControlCard { background: #181B22; border: 1px solid #222732; border-radius: 10px; }
+                QFrame#RelayControlCard[active="true"] { border: 1px solid rgba(163, 230, 53, 0.4); background: #151A21; }
+                
+                QLabel#BadgeOn { background-color: #15803D; color: #BEF264; border-radius: 4px; font-weight: bold; font-size: 7.5pt; }
+                QLabel#BadgeOff { background-color: #1E293B; color: #64748B; border-radius: 4px; font-weight: bold; font-size: 7.5pt; }
+                
+                QPushButton#RelayOffBtn { background: #1E232B; color: #A3E635; border: 1px solid #A3E635; border-radius: 6px; font-weight: bold; }
+                QPushButton#RelayOffBtn:hover { background: #A3E635; color: #0F1115; }
+                QPushButton#RelayOnBtn { background: #DC2626; color: white; border: 1px solid #EF4444; border-radius: 6px; font-weight: bold; }
+                QPushButton#RelayOnBtn:hover { background: #991B1B; }
+
+                QComboBox { background: #14171C; border: 1px solid #1E232B; border-radius: 8px; padding: 5px; color: #F8FAFC; min-width: 90px; }
+                QTextEdit { background: #090A0D; border: 1px solid #1E232B; border-top-left-radius: 8px; border-top-right-radius: 8px; color: #34D399; font-family: 'Consolas', monospace; font-size: 9.5pt; padding: 10px; border-bottom: none; }
+                QLineEdit#CliInput { background: #090A0D; border: 1px solid #1E232B; border-bottom-left-radius: 8px; border-bottom-right-radius: 8px; color: #E2E8F0; font-family: 'Consolas', monospace; font-size: 10pt; padding: 8px; border-top: 1px dashed #1E232B; }
+            """)
+        else:
+            self.setStyleSheet("""
+                QMainWindow { background: #F8FAFC; }
+                QWidget { color: #334155; font-family: 'Segoe UI', sans-serif; font-size: 10pt; }
+                QWidget#Sidebar { background-color: #E2E8F0; border-right: 1px solid #CBD5E1; }
+                QWidget#CenterWidget { background-color: #FFFFFF; }
+                QWidget#RightSidebar { background-color: #F1F5F9; border-left: 1px solid #CBD5E1; }
+                
+                QFrame#TopControlBar { background: #FFFFFF; border: 1px solid #CBD5E1; border-radius: 12px; }
+                
+                QLabel#Avatar { background-color: #65A30D; color: #FFFFFF; border-radius: 18px; font-weight: bold; font-size: 10pt; }
+                QPushButton#NavButton { background: transparent; color: #475569; border: none; text-align: left; padding: 11px 14px; border-radius: 8px; font-weight: 500; }
+                QPushButton#NavButton:hover { background: #CBD5E1; color: #0F172A; }
+                QPushButton#NavButtonActive { background: #D9F99D; color: #365314; border: 1px solid #A3E635; text-align: left; padding: 11px 14px; border-radius: 8px; font-weight: bold; }
+                
+                QGroupBox { background: #FFFFFF; border: 1px solid #CBD5E1; border-radius: 12px; margin-top: 14px; font-size: 8.5pt; font-weight: bold; color: #475569; padding: 15px; }
+                QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; left: 15px; top: 5px; }
+                
+                QFrame#StatusCard { background: #E2E8F0; border-radius: 12px; border: 1px solid #CBD5E1; }
+                QLabel#TeamAvatar { background-color: #CBD5E1; color: #0F172A; border-radius: 14px; font-weight: bold; font-size: 9pt; }
+                
+                QPushButton#PrimaryButton { background: #65A30D; color: #FFFFFF; border: none; border-radius: 8px; padding: 6px 16px; font-weight: bold; }
+                QPushButton#PrimaryButton:hover { background: #4D7C0F; }
+                QPushButton#SecondaryButton { background: #E2E8F0; color: #0F172A; border: 1px solid #CBD5E1; border-radius: 8px; padding: 6px 14px; }
+                QPushButton#SecondaryButton:hover { background: #CBD5E1; }
+                
+                QPushButton#EStopButton { background: #DC2626; color: white; font-weight: bold; border-radius: 8px; padding: 6px 16px; border: 1px solid #EF4444; }
+
+                QFrame#RelayControlCard { background: #F1F5F9; border: 1px solid #CBD5E1; border-radius: 10px; }
+                QFrame#RelayControlCard[active="true"] { border: 2px solid #65A30D; background: #ECFDF5; }
+                
+                QLabel#BadgeOn { background-color: #16A34A; color: #FFFFFF; border-radius: 4px; font-weight: bold; font-size: 7.5pt; }
+                QLabel#BadgeOff { background-color: #CBD5E1; color: #475569; border-radius: 4px; font-weight: bold; font-size: 7.5pt; }
+                
+                QPushButton#RelayOffBtn { background: #FFFFFF; color: #65A30D; border: 1px solid #65A30D; border-radius: 6px; font-weight: bold; }
+                QPushButton#RelayOffBtn:hover { background: #65A30D; color: #FFFFFF; }
+                QPushButton#RelayOnBtn { background: #DC2626; color: white; border: 1px solid #EF4444; border-radius: 6px; font-weight: bold; }
+                QPushButton#RelayOnBtn:hover { background: #991B1B; }
+
+                QComboBox { background: #FFFFFF; border: 1px solid #CBD5E1; border-radius: 8px; padding: 5px; color: #0F172A; min-width: 90px; }
+                QTextEdit { background: #F1F5F9; border: 1px solid #CBD5E1; border-top-left-radius: 8px; border-top-right-radius: 8px; color: #065F46; font-family: 'Consolas', monospace; font-size: 9.5pt; padding: 10px; border-bottom: none; }
+                QLineEdit#CliInput { background: #F1F5F9; border: 1px solid #CBD5E1; border-bottom-left-radius: 8px; border-bottom-right-radius: 8px; color: #0F172A; font-family: 'Consolas', monospace; font-size: 10pt; padding: 8px; border-top: 1px dashed #CBD5E1; }
+            """)
+
+    def refresh_ports(self):
+        self.port_combo.clear()
+        ports = serial.tools.list_ports.comports()
+        for p in ports:
+            self.port_combo.addItem(p.device)
+
+    def toggle_connection(self):
+        if self.ser:
+            self.reader.stop()
+            self.reader.wait()
+            self.ser.close()
+            self.ser = None
+            self.connect_btn.setText("Connect")
+            self.connect_btn.setObjectName("PrimaryButton")
+            self.connect_btn.setStyle(self.connect_btn.style())
+            self.status_label.setText("OFFLINE")
+            self.status_label.setStyleSheet("color: #EF4444; font-weight: bold; font-size: 16pt;")
+            return
+
+        try:
+            port = self.port_combo.currentText()
+            if not port: return
+            self.ser = serial.Serial(port, 115200, timeout=1)
+            self.reader = SerialReader(self.ser)
+            self.reader.data_received.connect(self.process_line)
+            self.reader.start()
+
+            self.connect_btn.setText("Disconnect")
+            self.connect_btn.setObjectName("SecondaryButton")
+            self.connect_btn.setStyle(self.connect_btn.style())
+            self.status_label.setText("ONLINE")
+            self.status_label.setStyleSheet("color: #A3E635; font-weight: bold; font-size: 16pt;")
+            self.append_log(f"📡 System interface connected to base hardware port {port}")
+            
+            # Send Auto Anti-Replay Sync Frame to hardware
+            QTimer.singleShot(100, lambda: self.ser.write(b"SYNC\n"))
+        except Exception as e:
+            QMessageBox.critical(self, "Hardware Interface Error", str(e))
+
+    def update_interlock_group_rules(self):
+        self.interlocked_indices = []
+        for idx, btn in enumerate(self.selector_buttons):
+            if btn.isChecked():
+                self.interlocked_indices.append(idx)
+
+    def reset_all_interlock_rules(self):
+        for btn in self.selector_buttons:
+            btn.blockSignals(True)
+            btn.setChecked(False)
+            btn.blockSignals(False)
+        
+        self.interlocked_indices = []
+        self.interlock_status_lbl.setText("🛡️ SAFETY INTERLOCKS ACTIVE — NO ACTIVE VIOLATIONS")
+        self.interlock_status_lbl.setStyleSheet("color: #34D399; padding: 12px; background: #064E3B; border-radius: 6px;")
+        self.append_log("🔓 User Action: All selection zones wiped to Normal.")
+
+    def update_relay_timeout_limit(self, relay_idx, total_seconds):
+        self.relay_time_limits[relay_idx] = total_seconds
+        if total_seconds == 0:
+            self.relay_time_elapsed[relay_idx] = 0
+            self.progress_bars[relay_idx].setValue(0)
+            self.progress_bars[relay_idx].setFormat("Continuous (∞)")
+
+    def process_relay_timeouts(self):
+        command_needed = False
+        next_command_bits = ["0", "0", "0", "0"]
+
+        for i in range(4):
+            if self.current_relay_states[i]:
+                limit = self.relay_time_limits[i]
+                next_command_bits[i] = "1"
+                
+                if limit > 0:
+                    self.relay_time_elapsed[i] += 1
+                    elapsed = self.relay_time_elapsed[i]
+                    
+                    percentage = int((elapsed / limit) * 100)
+                    self.progress_bars[i].setValue(min(100, percentage))
+                    
+                    if limit < 60:
+                        lbl_text = f"RUNNING ({elapsed}/{limit}s)"
+                        self.progress_bars[i].setFormat(lbl_text)
+                        self.relay_cards[i].set_state(True, lbl_text)
+                    else:
+                        elapsed_m, elapsed_s = divmod(elapsed, 60)
+                        limit_m = limit // 60
+                        lbl_text = f"RUNNING ({elapsed_m}m {elapsed_s}s / {limit_m}m)"
+                        self.progress_bars[i].setFormat(lbl_text)
+                        self.relay_cards[i].set_state(True, lbl_text)
+                    
+                    if elapsed >= limit:
+                        limit_text = f"{limit}s" if limit < 60 else f"{limit // 60}m"
+                        self.append_log(f"⏱️ TIMEOUT FAULT: Relay Node 0{i+1} ran past safety limit of {limit_text}!")
+                        next_command_bits[i] = "0"
+                        command_needed = True
+                else:
+                    self.progress_bars[i].setValue(0)
+                    self.progress_bars[i].setFormat("Continuous (∞)")
+                    self.relay_cards[i].set_state(True, "Continuous (∞)")
+            else:
+                self.relay_time_elapsed[i] = 0
+                self.progress_bars[i].setValue(0)
+                limit = self.relay_time_limits[i]
+                if limit > 0:
+                    lbl_text = f"Ready ({limit}s max)" if limit < 60 else f"Ready ({limit // 60}m max)"
+                    self.progress_bars[i].setFormat(lbl_text)
+                    self.relay_cards[i].set_state(False, lbl_text)
+                else:
+                    self.progress_bars[i].setFormat("Idle")
+                    self.relay_cards[i].set_state(False, "Idle")
+
+        if command_needed and self.ser and self.ser.is_open:
+            payload = f"CMD|{next_command_bits[0]}|{next_command_bits[1]}|{next_command_bits[2]}|{next_command_bits[3]}\n"
+            try:
+                self.ser.write(payload.encode())
+                self.append_log(f"⚠️ AUTOMATED SAFETY CUTOFF SENT -> {payload.strip()}")
+            except Exception as e:
+                self.append_log(f"❌ Failed to execute automated timed safety payload: {str(e)}")
+
+    def trigger_hardware_safety_trip(self, custom_msg):
+        for card in self.relay_cards:
+            card.set_state(False, "Emergency Stop")
+            
+        self.interlock_status_lbl.setText(f"🚨 FAULT: {custom_msg}")
+        self.interlock_status_lbl.setStyleSheet("color: #F8FAFC; padding: 12px; background: #991B1B; border-radius: 6px;")
+        
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.write(b"CMD|0|0|0|0\n")
+                self.append_log("⚠️ SAFETY OVERRIDE SENT: Broadcasted emergency shutdown frame -> CMD|0|0|0|0")
+            except Exception as e:
+                self.append_log(f"❌ Failed to transmit emergency trip packet: {str(e)}")
+
+    def send_cli_command(self):
+        if not self.ser:
+            self.append_log("⚠️ Execution failed: Connection offline.")
+            return
+        raw_text = self.cli_input.text().strip()
+        if not raw_text: return
+        
+        if raw_text.startswith("CMD|"):
+            if raw_text.endswith("|") or "||" in raw_text:
+                self.append_log(f"❌ EXECUTION REJECTED [FAULT]: Incomplete array detected: '{raw_text}'")
+                self.trigger_hardware_safety_trip("CLI PACKET CONTAINS MISSING INDICES")
+                self.cli_input.clear()
+                return
+
+            tokens = raw_text.split("|")[1:]
+            if len(tokens) != 4 or "" in tokens or any(t.isspace() for t in tokens):
+                self.append_log(f"❌ EXECUTION REJECTED [FAULT]: Tokens must match 4 binary states: '{raw_text}'")
+                self.trigger_hardware_safety_trip("INVALID BIT FRAME PATTERN LENGTH")
+                self.cli_input.clear()
+                return
+                
+            if len(self.interlocked_indices) >= 2:
+                active_violations_found = 0
+                violated_channels = []
+                
+                for idx in self.interlocked_indices:
+                    if tokens[idx] == "1":
+                        active_violations_found += 1
+                        violated_channels.append(str(idx + 1))
+                
+                if active_violations_found > 1:
+                    channels_str = ", ".join(violated_channels)
+                    self.append_log(f"❌ INTERLOCK BLOCKED: Relays ({channels_str}) are grouped in an exclusion rule set!")
+                    self.trigger_hardware_safety_trip(f"GROUP CONSTRAINT HAZARD (Relays: {channels_str})")
+                    self.cli_input.clear()
+                    return
+
+        try:
+            self.ser.write((raw_text + "\n").encode())
+            self.append_log(f"⌨️ CLI Executed Payload Send: {raw_text}")
+            self.cli_input.clear()
+        except Exception as e:
+            self.append_log(f"⚠️ CLI Error: {str(e)}")
+
+    def process_line(self, line):
+        self.append_log(f"📥 {line}")
+        
+        if "RELAYS:" in line or "RSSI:" in line:
+            self.packet_count += 1
+            self.packet_label.setText(str(self.packet_count))
+
+        if line.startswith("RSSI:"):
+            try:
+                rssi = int(line.replace("RSSI:", ""))
+                self.rssi_label.setText(f"{rssi} dBm")
+                strength = max(0, min(100, rssi + 120))
+                self.waveform.add_point(strength)
+            except:
+                pass
+
+        if line.startswith("RELAYS:"):
+            raw_payload = line.replace("RELAYS:", "")
+            
+            if raw_payload.endswith(",") or ",," in raw_payload:
+                self.append_log("⚠️ INTERLOCK ALERT [FAULT]: Inbound frame dropped critical bits.")
+                self.trigger_hardware_safety_trip("INCOMING PACKET HAS MISSING INDICES")
+                return
+
+            data = raw_payload.split(",")
+            if len(data) != 4 or "" in data or any(val.isspace() for val in data):
+                self.append_log("⚠️ INTERLOCK ALERT [FAULT]: Array length broke boundary thresholds.")
+                self.trigger_hardware_safety_trip("INVALID INCOMING FRAME STRUCTURE")
+                return
+
+            if len(self.interlocked_indices) >= 2:
+                active_violations_found = 0
+                violated_channels = []
+                
+                for idx in self.interlocked_indices:
+                    if data[idx] == "1":
+                        active_violations_found += 1
+                        violated_channels.append(str(idx + 1))
+                        
+                if active_violations_found > 1:
+                    channels_str = ", ".join(violated_channels)
+                    self.append_log(f"⚠️ INTERLOCK HAZARD [FAULT]: Remote unit triggered overlapping relays: ({channels_str})")
+                    self.trigger_hardware_safety_trip(f"REMOTE GROUP VIOLATION (Relays: {channels_str})")
+                    return
+
+            self.interlock_status_lbl.setText("🛡️ SAFETY INTERLOCKS ACTIVE — NO ACTIVE VIOLATIONS")
+            self.interlock_status_lbl.setStyleSheet("color: #34D399; padding: 12px; background: #064E3B; border-radius: 6px;")
+            
+            for i in range(4):
+                is_active = (data[i] == "1")
+                self.current_relay_states[i] = is_active
+                self.relay_cards[i].set_state(is_active)
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = Dashboard()
+    window.show()
+    sys.exit(app.exec())
