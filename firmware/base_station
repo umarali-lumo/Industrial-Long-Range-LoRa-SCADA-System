@@ -1,0 +1,138 @@
+#include <SPI.h>
+#include <LoRa.h>
+#include <Crypto.h>
+#include <AES.h>
+#include <CTR.h>
+#include <SHA256.h>
+
+const uint8_t AES_KEY[16] = {
+  0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
+  0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
+};
+
+const uint8_t BASE_IV[16] = {
+  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+  0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F
+};
+
+const uint16_t TARGET_NODE_ID = 3;
+uint32_t tx_sequence_number = 1;
+
+CTR<AES128> ctr;
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  LoRa.setPins(5, 14, 26);
+  if (!LoRa.begin(433E6)) {
+    Serial.println("SYSTEM_ERROR: LoRa initialization failed!");
+    while (1);
+  }
+  Serial.println("SYSTEM_STATUS: SECURE_ONLINE");
+}
+
+void sendSecureFrame(String rawPayload) {
+  uint8_t payloadBytes[64];
+  uint8_t encryptedBytes[64];
+  uint8_t iv[16];
+  
+  int len = rawPayload.length();
+  memcpy(payloadBytes, rawPayload.c_str(), len);
+
+  memcpy(iv, BASE_IV, 16);
+  iv[12] = (tx_sequence_number >> 24) & 0xFF;
+  iv[13] = (tx_sequence_number >> 16) & 0xFF;
+  iv[14] = (tx_sequence_number >> 8) & 0xFF;
+  iv[15] = tx_sequence_number & 0xFF;
+
+  ctr.setKey(AES_KEY, 16);
+  ctr.setIV(iv, 16);
+  ctr.encrypt(encryptedBytes, payloadBytes, len);
+
+  SHA256 sha;
+  sha.resetHMAC(AES_KEY, 16);
+  sha.update((uint8_t*)&TARGET_NODE_ID, sizeof(TARGET_NODE_ID));
+  sha.update((uint8_t*)&tx_sequence_number, sizeof(tx_sequence_number));
+  sha.update(encryptedBytes, len);
+  uint8_t hmacResult[32];
+  sha.finalizeHMAC(AES_KEY, 16, hmacResult, 32);
+
+  LoRa.beginPacket();
+  LoRa.write((uint8_t)(TARGET_NODE_ID & 0xFF));
+  LoRa.write((uint8_t)((TARGET_NODE_ID >> 8) & 0xFF));
+
+  LoRa.write((uint8_t)(tx_sequence_number & 0xFF));
+  LoRa.write((uint8_t)((tx_sequence_number >> 8) & 0xFF));
+  LoRa.write((uint8_t)((tx_sequence_number >> 16) & 0xFF));
+  LoRa.write((uint8_t)((tx_sequence_number >> 24) & 0xFF));
+
+  for (int i = 0; i < 8; i++) LoRa.write(hmacResult[i]);
+  for (int i = 0; i < len; i++) LoRa.write(encryptedBytes[i]);
+  
+  LoRa.endPacket();
+  tx_sequence_number++;
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd == "SYNC") {
+      tx_sequence_number = 1; // Reset local counter on SYNC request
+      sendSecureFrame("CMD|RESET_SEQ");
+      Serial.println("SYSTEM_STATUS: SYNCED");
+    } else if (cmd.startsWith("CMD|")) {
+      sendSecureFrame(cmd);
+    }
+  }
+
+  int packetSize = LoRa.parsePacket();
+  if (packetSize > 14) {
+    int currentRssi = LoRa.packetRssi();
+
+    uint16_t rxNodeId = LoRa.read() | (LoRa.read() << 8);
+    uint32_t rxSeqNum = (uint32_t)LoRa.read() | ((uint32_t)LoRa.read() << 8) |
+                        ((uint32_t)LoRa.read() << 16) | ((uint32_t)LoRa.read() << 24);
+
+    uint8_t receivedMac[8];
+    for (int i = 0; i < 8; i++) receivedMac[i] = LoRa.read();
+
+    int encLen = packetSize - 14;
+    uint8_t encBuf[64];
+    for (int i = 0; i < encLen; i++) encBuf[i] = LoRa.read();
+
+    SHA256 sha;
+    sha.resetHMAC(AES_KEY, 16);
+    sha.update((uint8_t*)&rxNodeId, sizeof(rxNodeId));
+    sha.update((uint8_t*)&rxSeqNum, sizeof(rxSeqNum));
+    sha.update(encBuf, encLen);
+    uint8_t expectedHmac[32];
+    sha.finalizeHMAC(AES_KEY, 16, expectedHmac, 32);
+
+    if (memcmp(receivedMac, expectedHmac, 8) == 0) {
+      uint8_t iv[16];
+      memcpy(iv, BASE_IV, 16);
+      iv[12] = (rxSeqNum >> 24) & 0xFF;
+      iv[13] = (rxSeqNum >> 16) & 0xFF;
+      iv[14] = (rxSeqNum >> 8) & 0xFF;
+      iv[15] = rxSeqNum & 0xFF;
+
+      uint8_t decBuf[64];
+      ctr.setKey(AES_KEY, 16);
+      ctr.setIV(iv, 16);
+      ctr.decrypt(decBuf, encBuf, encLen);
+      decBuf[encLen] = '\0';
+
+      String telemetry = String((char*)decBuf);
+      telemetry.trim();
+
+      if (telemetry.startsWith("RELAYS:")) {
+        Serial.println(telemetry);
+        Serial.print("RSSI:");
+        Serial.println(currentRssi);
+      }
+    }
+  }
+}
