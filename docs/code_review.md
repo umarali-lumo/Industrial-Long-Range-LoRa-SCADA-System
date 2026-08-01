@@ -37,11 +37,3 @@ This document provides a professional review of the secure LoRa SCADA system and
 - **CRC Validation:** While LoRa has hardware CRC, adding a software-level checksum to the plaintext would provide an extra layer of structural validation.
 
 ---
-
-## 👨‍💼 Hiring Manager's Perspective
-
-### **Senior Firmware Engineer**
-> "The candidate demonstrates a deep understanding of secure embedded systems. Implementing authenticated encryption on a resource-constrained LoRa link requires balancing security with airtime, and this project handles it perfectly. The use of sequence numbers for anti-replay shows they understand real-world attack vectors."
-
-### **Research Professor (IoT & Cybersecurity)**
-> "This is an excellent example of applying modern cryptographic primitives to legacy-style SCADA problems. The theoretical framing of Chirp Spread Spectrum path loss alongside AES-CTR implementation makes this a standout research prototype."
